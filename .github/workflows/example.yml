@@ -1,0 +1,53 @@
+# Example workflow showing how to use the configure-border0-network action
+# Copy this to .github/workflows/ in your repository and customize as needed
+
+name: Example Border0 Network Usage
+
+on:
+  workflow_dispatch:
+    inputs:
+      border0-org-subdomain:
+        description: 'Border0 organization subdomain'
+        required: false
+        default: 'adriano-vpn'
+      border0-svc-account-name:
+        description: 'Border0 service account name'
+        required: false
+        default: 'github-actions'
+      border0-playground-db-socket:
+        description: 'Border0 playground database socket name'
+        required: false
+        default: 'test-mysql-server'
+
+jobs:
+  run-example:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Border0 VPN
+        id: border0-vpn
+        uses: ./
+        with:
+          border0-org-subdomain: ${{ github.event.inputs.border0-org-subdomain || 'adriano-vpn' }}
+          border0-svc-account-name: ${{ github.event.inputs.border0-svc-account-name || 'github-actions' }}
+          border0-token-duration-seconds: 900
+          debug: true
+
+      - name: Install MySQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+
+      - name: Query MySQL database via Border0
+        run: |
+          echo "Querying MySQL database at ${{ github.event.inputs.border0-playground-db-socket || 'test-mysql-server' }}..."
+          mysql -h ${{ github.event.inputs.border0-playground-db-socket || 'test-mysql-server' }} books -e "SELECT * FROM authors;"
+
+      - name: Stop Border0 VPN
+        if: always()
+        run: bash ${{ steps.border0-vpn.outputs.cleanup-script }}

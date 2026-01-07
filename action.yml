@@ -1,0 +1,198 @@
+name: 'Configure Border0 Network'
+description: 'Install Border0 CLI and start VPN node'
+author: 'Border0'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  border0-token:
+    description: 'Border0 authentication token (if not provided, will require identity federation parameters)'
+    required: false
+  border0-org-subdomain:
+    description: 'Border0 organization name (used with identity federation)'
+    required: false
+  border0-svc-account-name:
+    description: 'Border0 service account name (used with identity federation)'
+    required: false
+  border0-token-duration-seconds:
+    description: 'Token duration in seconds (used with identity federation)'
+    required: false
+    default: '3600'
+  vpn-wait-seconds:
+    description: 'Seconds to wait for VPN connection to establish'
+    required: false
+    default: '5'
+  debug:
+    description: 'Enable debug output (shows VPN peers)'
+    required: false
+    default: 'false'
+
+outputs:
+  cleanup-script:
+    description: 'Path to the cleanup script for stopping the Border0 VPN node'
+    value: /tmp/border0-cleanup.sh
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate Inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.border0-token }}" ]; then
+          if [ -z "${{ inputs.border0-org-subdomain }}" ] || [ -z "${{ inputs.border0-svc-account-name }}" ]; then
+            echo "Error: Either 'border0-token' or both 'border0-org-subdomain' and 'border0-svc-account-name' must be provided"
+            exit 1
+          fi
+        fi
+
+    - name: Configure Border0 Credentials via Identity Federation (If Token Not Provided)
+      if: ${{ inputs.border0-token == '' }}
+      id: border0-creds
+      uses: borderzero/configure-border0-credentials@v0.0.5
+      with:
+        border0-org-subdomain: ${{ inputs.border0-org-subdomain }}
+        border0-svc-account-name: ${{ inputs.border0-svc-account-name }}
+        border0-token-duration-seconds: ${{ inputs.border0-token-duration-seconds }}
+
+    - name: Detect architecture and download Border0 CLI
+      shell: bash
+      run: |
+        set -e
+
+        # Detect architecture
+        ARCH=$(uname -m)
+        case $ARCH in
+          x86_64)
+            DOWNLOAD_URL="https://download.border0.com/linux_amd64/border0"
+            ;;
+          aarch64|arm64)
+            DOWNLOAD_URL="https://download.border0.com/linux_arm64/border0"
+            ;;
+          armv7l|arm)
+            DOWNLOAD_URL="https://download.border0.com/linux_arm/border0"
+            ;;
+          *)
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+            ;;
+        esac
+
+        echo "Downloading Border0 CLI from $DOWNLOAD_URL"
+        curl -L -o /tmp/border0 "$DOWNLOAD_URL"
+        chmod +x /tmp/border0
+        echo "Border0 CLI installed successfully"
+
+        # Verify installation
+        /tmp/border0 version || echo "Border0 CLI ready"
+
+    - name: Start Border0 VPN node
+      shell: bash
+      run: |
+        set -e
+
+        # Use provided token or token from identity federation
+        TOKEN="${{ inputs.border0-token }}"
+        if [ -z "$TOKEN" ]; then
+          TOKEN="${{ steps.border0-creds.outputs.token }}"
+        fi
+
+        echo "Starting Border0 VPN node with sudo..."
+        nohup sudo /tmp/border0 node start --start-vpn --ephemeral --token "$TOKEN" > /tmp/border0-node.log 2>&1 &
+        BORDER0_PID=$!
+
+        echo "BORDER0_NODE_PID=$BORDER0_PID" >> $GITHUB_ENV
+        echo "Border0 VPN node started with PID: $BORDER0_PID"
+
+        # Wait a moment and check if process is still running
+        sleep 2
+        if ps -p $BORDER0_PID > /dev/null; then
+          echo "Border0 VPN node is running"
+          echo "Log file: /tmp/border0-node.log"
+        else
+          echo "Border0 VPN node failed to start"
+          cat /tmp/border0-node.log
+          exit 1
+        fi
+
+    - name: Save PID for cleanup
+      shell: bash
+      run: |
+        echo "${{ env.BORDER0_NODE_PID }}" > /tmp/border0-node.pid
+        echo "PID saved to /tmp/border0-node.pid"
+
+    - name: Create cleanup script
+      shell: bash
+      run: |
+        cat > /tmp/border0-cleanup.sh << 'EOF'
+        #!/bin/bash
+        # Cleanup script to stop Border0 VPN node
+        set -e
+
+        if [ -f /tmp/border0-node.pid ]; then
+          PID=$(cat /tmp/border0-node.pid)
+          echo "Stopping Border0 VPN node (PID: $PID)..."
+
+          if ps -p $PID > /dev/null 2>&1; then
+            sudo kill $PID 2>/dev/null || true
+            echo "Border0 VPN node stopped successfully"
+
+            # Wait for graceful shutdown
+            sleep 2
+
+            # Force kill if still running
+            if ps -p $PID > /dev/null 2>&1; then
+              echo "Force killing Border0 VPN node..."
+              sudo kill -9 $PID 2>/dev/null || true
+            fi
+          else
+            echo "Border0 VPN node process not found (already stopped)"
+          fi
+
+          rm -f /tmp/border0-node.pid
+        else
+          echo "No PID file found, nothing to clean up"
+        fi
+
+        # Show last few lines of log
+        if [ -f /tmp/border0-node.log ]; then
+          echo "Last 10 lines of Border0 node log:"
+          tail -n 10 /tmp/border0-node.log
+        fi
+        EOF
+
+        chmod +x /tmp/border0-cleanup.sh
+        echo "Cleanup script created at /tmp/border0-cleanup.sh"
+
+    - name: Wait for VPN connection
+      shell: bash
+      run: |
+        echo "Waiting ${{ inputs.vpn-wait-seconds }} seconds for VPN connection to establish..."
+        sleep ${{ inputs.vpn-wait-seconds }}
+        echo "VPN connection ready"
+
+    - name: Debug VPN peers
+      if: ${{ inputs.debug == 'true' }}
+      shell: bash
+      run: |
+        echo "Debugging Border0 VPN peers..."
+        # Install jq if not available
+        if ! command -v jq &> /dev/null; then
+          echo "Installing jq..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+        fi
+        /tmp/border0 node debug peers --json | jq || echo "Debug command failed"
+        echo ""
+        echo "=== Network Diagnostics ==="
+        echo ""
+        echo "Network interfaces:"
+        ip addr show || true
+        echo ""
+        echo "Checking for utun/tun interfaces:"
+        ip link show | grep -E "utun|tun" || echo "No utun/tun interfaces found"
+        echo ""
+        echo "Routing table:"
+        ip route || true
+        echo ""
+        echo "Border0 node logs (last 50 lines):"
+        tail -n 50 /tmp/border0-node.log || echo "No logs found"
